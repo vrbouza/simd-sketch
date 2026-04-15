@@ -11,7 +11,7 @@ use itertools::Itertools;
 use log::info;
 use packed_seq::{PackedNSeqVec, PackedSeqVec, SeqVec};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use simd_sketch::SketchParams;
+use simd_sketch::{BitSketch, HashMode, Sketch, SketchParams};
 
 /// Compute the sketch distance between two fasta files.
 #[derive(clap::Parser)]
@@ -84,15 +84,126 @@ const BINCODE_CONFIG: bincode::config::Configuration<
     bincode::config::Fixint,
 > = bincode::config::standard().with_fixed_int_encoding();
 const EXTENSION: &str = "ssketch";
-const SKETCH_VERSION: usize = 1;
+const SKETCH_VERSION_V1: usize = 1;
+const SKETCH_VERSION_V2: usize = 2;
 
 #[derive(bincode::Encode, bincode::Decode)]
-pub struct VersionedSketch {
-    /// This version of simd-sketch only supports encoding version 1.
-    /// This is encoded first, so that it can (hopefully) still be recovered in case decoding fails.
+pub struct VersionedSketchV2 {
     version: usize,
-    /// The sketch itself.
-    sketch: simd_sketch::Sketch,
+    sketch: Sketch,
+}
+
+#[derive(bincode::Encode, bincode::Decode)]
+enum LegacySketch {
+    BottomSketch(LegacyBottomSketch),
+    BucketSketch(LegacyBucketSketch),
+}
+
+#[derive(bincode::Encode, bincode::Decode)]
+struct LegacyBottomSketch {
+    rc: bool,
+    k: usize,
+    seed: u32,
+    count: usize,
+    bottom: Vec<u32>,
+}
+
+#[derive(bincode::Encode, bincode::Decode)]
+struct LegacyBucketSketch {
+    rc: bool,
+    k: usize,
+    b: usize,
+    seed: u32,
+    count: usize,
+    buckets: LegacyBitSketch,
+    empty: Vec<u64>,
+}
+
+#[derive(bincode::Encode, bincode::Decode)]
+enum LegacyBitSketch {
+    B32(Vec<u32>),
+    B16(Vec<u16>),
+    B8(Vec<u8>),
+    B1(Vec<u64>),
+}
+
+#[derive(bincode::Encode, bincode::Decode)]
+struct VersionedSketchV1 {
+    version: usize,
+    sketch: LegacySketch,
+}
+
+impl From<LegacyBitSketch> for BitSketch {
+    fn from(value: LegacyBitSketch) -> Self {
+        match value {
+            LegacyBitSketch::B32(v) => BitSketch::B32(v),
+            LegacyBitSketch::B16(v) => BitSketch::B16(v),
+            LegacyBitSketch::B8(v) => BitSketch::B8(v),
+            LegacyBitSketch::B1(v) => BitSketch::B1(v),
+        }
+    }
+}
+
+impl From<LegacySketch> for Sketch {
+    fn from(value: LegacySketch) -> Self {
+        match value {
+            LegacySketch::BottomSketch(sketch) => Sketch::BottomSketch(simd_sketch::BottomSketch {
+                hash_mode: HashMode::Legacy32,
+                rc: sketch.rc,
+                k: sketch.k,
+                seed: sketch.seed,
+                count: sketch.count,
+                bottom: sketch.bottom.into_iter().map(|x| x as u64).collect(),
+            }),
+            LegacySketch::BucketSketch(sketch) => Sketch::BucketSketch(simd_sketch::BucketSketch {
+                hash_mode: HashMode::Legacy32,
+                rc: sketch.rc,
+                k: sketch.k,
+                b: sketch.b,
+                seed: sketch.seed,
+                count: sketch.count,
+                buckets: sketch.buckets.into(),
+                empty: sketch.empty,
+            }),
+        }
+    }
+}
+
+impl TryFrom<&Sketch> for LegacySketch {
+    type Error = ();
+
+    fn try_from(value: &Sketch) -> Result<Self, Self::Error> {
+        match value {
+            Sketch::BottomSketch(sketch) if sketch.hash_mode == HashMode::Legacy32 => {
+                Ok(LegacySketch::BottomSketch(LegacyBottomSketch {
+                    rc: sketch.rc,
+                    k: sketch.k,
+                    seed: sketch.seed,
+                    count: sketch.count,
+                    bottom: sketch.bottom.iter().map(|x| *x as u32).collect(),
+                }))
+            }
+            Sketch::BucketSketch(sketch) if sketch.hash_mode == HashMode::Legacy32 => {
+                let buckets = match &sketch.buckets {
+                    BitSketch::B32(v) => LegacyBitSketch::B32(v.clone()),
+                    BitSketch::B16(v) => LegacyBitSketch::B16(v.clone()),
+                    BitSketch::B8(v) => LegacyBitSketch::B8(v.clone()),
+                    BitSketch::B1(v) => LegacyBitSketch::B1(v.clone()),
+                    BitSketch::B64(_) => return Err(()),
+                };
+                Ok(LegacySketch::BucketSketch(LegacyBucketSketch {
+                    rc: sketch.rc,
+                    k: sketch.k,
+                    b: sketch.b,
+                    seed: sketch.seed,
+                    count: sketch.count,
+                    buckets,
+                    empty: sketch.empty.clone(),
+                }))
+            }
+            _ => Err(()),
+        }
+    }
 }
 
 fn main() {
@@ -161,18 +272,24 @@ fn main() {
             let read_sketch = |path| {
                 num_read.fetch_add(1, Relaxed);
                 let mut file = File::open(path).unwrap();
-                // Read the first integer to check the version.
                 let version: usize =
                     bincode::decode_from_std_read(&mut file, BINCODE_CONFIG).unwrap();
-                if version != SKETCH_VERSION {
-                    panic!("Unsupported sketch version: {version}. Only version {SKETCH_VERSION} is supported.");
-                }
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
-                let VersionedSketch {
-                    version,
-                    sketch,
-                } = bincode::decode_from_std_read(&mut file, BINCODE_CONFIG).unwrap();
-                assert_eq!(version, SKETCH_VERSION);
+                let sketch = match version {
+                    SKETCH_VERSION_V1 => {
+                        let VersionedSketchV1 { version, sketch } =
+                            bincode::decode_from_std_read(&mut file, BINCODE_CONFIG).unwrap();
+                        assert_eq!(version, SKETCH_VERSION_V1);
+                        Sketch::from(sketch)
+                    }
+                    SKETCH_VERSION_V2 => {
+                        let VersionedSketchV2 { version, sketch } =
+                            bincode::decode_from_std_read(&mut file, BINCODE_CONFIG).unwrap();
+                        assert_eq!(version, SKETCH_VERSION_V2);
+                        sketch
+                    }
+                    _ => panic!("Unsupported sketch version: {version}."),
+                };
 
                 let mut sketch_params = sketch.to_params();
                 sketch_params.filter_empty = params.filter_empty;
@@ -228,17 +345,23 @@ fn main() {
 
             if save_sketches {
                 num_written.fetch_add(1, Relaxed);
-                let versioned_sketch = VersionedSketch {
-                    version: SKETCH_VERSION,
-                    sketch,
-                };
-                bincode::encode_into_std_write(
-                    &versioned_sketch,
-                    &mut File::create(ssketch_path).unwrap(),
-                    BINCODE_CONFIG,
-                )
-                .unwrap();
-                sketch = versioned_sketch.sketch;
+                let mut writer = File::create(ssketch_path).unwrap();
+                if params.hash_mode == HashMode::Legacy32 {
+                    let versioned_sketch = VersionedSketchV1 {
+                        version: SKETCH_VERSION_V1,
+                        sketch: LegacySketch::try_from(&sketch).unwrap(),
+                    };
+                    bincode::encode_into_std_write(&versioned_sketch, &mut writer, BINCODE_CONFIG)
+                        .unwrap();
+                } else {
+                    let versioned_sketch = VersionedSketchV2 {
+                        version: SKETCH_VERSION_V2,
+                        sketch,
+                    };
+                    bincode::encode_into_std_write(&versioned_sketch, &mut writer, BINCODE_CONFIG)
+                        .unwrap();
+                    sketch = versioned_sketch.sketch;
+                }
             }
 
             sketch

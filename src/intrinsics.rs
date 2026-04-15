@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use core::mem::transmute;
 use packed_seq::u32x8 as S;
 const L: usize = 8;

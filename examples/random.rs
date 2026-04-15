@@ -15,6 +15,7 @@ fn main() {
 
         let bottom_sketcher = simd_sketch::SketchParams {
             alg: simd_sketch::SketchAlg::Bottom,
+            hash_mode: simd_sketch::HashMode::NtHash64,
             k,
             s,
             b,
@@ -28,6 +29,7 @@ fn main() {
         .build();
         let bucket_sketcher = simd_sketch::SketchParams {
             alg: simd_sketch::SketchAlg::Bucket,
+            hash_mode: simd_sketch::HashMode::NtHash64,
             k,
             s,
             b,

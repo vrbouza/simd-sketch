@@ -32,6 +32,7 @@ fn main() {
 
     let sketcher = SketchParams {
         alg: args.params.alg,
+        hash_mode: args.params.hash_mode,
         rc: true,
         k,
         s,
