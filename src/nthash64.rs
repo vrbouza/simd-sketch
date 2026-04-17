@@ -1,6 +1,6 @@
 use std::{array::from_fn, cmp::Ordering};
 
-use packed_seq::{BitSeq, ChunkIt, Delay, PaddedIt, Seq};
+use packed_seq::{BitSeq, ChunkIt, Delay, PackedSeq, PaddedIt, Seq};
 use wide::u32x8;
 
 use crate::nthash_tables;
@@ -220,7 +220,7 @@ pub fn for_each_hash_simd<'s>(
 }
 
 pub fn for_each_hash_simd_ambiguous<'s>(
-    seq: impl Seq<'s>,
+    seq: PackedSeq<'s>,
     ambiguous: BitSeq<'s>,
     k: usize,
     rc: bool,
@@ -229,12 +229,9 @@ pub fn for_each_hash_simd_ambiguous<'s>(
     if k == 0 {
         return;
     }
-    let bases = seq.par_iter_bp_delayed(k, Delay(k - 1));
-    let validity = ambiguous
-        .iter_kmer_ambiguity(k)
-        .map(|x| x as u32)
-        .collect::<Vec<_>>();
-    stream_hashes_from_pairs_ambiguous(bases, validity, k, rc, callback);
+    let bases = seq.par_iter_bp_delayed_with_factor(k, Delay(k - 1), 2);
+    let validity = ambiguous.par_iter_kmer_ambiguity_aligned(k);
+    stream_hashes_from_pairs_ambiguous(bases.zip(validity), k, rc, callback);
 }
 
 fn stream_hashes_from_pairs<I>(
@@ -280,28 +277,17 @@ fn warmup_base(state: &mut LaneState, window: &mut [u8], base: u8) {
     state.count += 1;
 }
 
-fn lane_offsets(valid_lens: [usize; 8]) -> [usize; 8] {
-    let mut offsets = [0; 8];
-    let mut sum = 0;
-    for lane in 0..8 {
-        offsets[lane] = sum;
-        sum += valid_lens[lane];
-    }
-    offsets
-}
-
 fn stream_hashes_from_pairs_ambiguous<I>(
     mut pairs: PaddedIt<I>,
-    validity: Vec<u32>,
     k: usize,
     rc: bool,
     callback: &mut dyn FnMut(u64),
 ) where
-    I: ChunkIt<(u32x8, u32x8)>,
+    I: ChunkIt<((u32x8, u32x8), u32x8)>,
 {
     let mut states: [LaneState; 8] = from_fn(|_| LaneState::new());
     let mut windows = vec![vec![0_u8; k]; 8];
-    pairs.advance_with(k.saturating_sub(1), |(incoming, _outgoing)| {
+    pairs.advance_with(k.saturating_sub(1), |((incoming, _outgoing), _validity)| {
         let incoming = incoming.to_array();
         for lane in 0..8 {
             warmup_base(&mut states[lane], &mut windows[lane], incoming[lane] as u8);
@@ -310,20 +296,19 @@ fn stream_hashes_from_pairs_ambiguous<I>(
 
     let lane_len = pairs.it.len();
     let valid_lens = lane_valid_lengths(lane_len, pairs.padding);
-    let offsets = lane_offsets(valid_lens);
 
-    for (step, (incoming, _outgoing)) in pairs.it.enumerate() {
+    for (step, ((incoming, _outgoing), validity)) in pairs.it.enumerate() {
         let incoming = incoming.to_array();
+        let validity = validity.to_array();
         for lane in 0..8 {
             if step >= valid_lens[lane] {
                 continue;
             }
-            let validity_idx = offsets[lane] + step;
             process_base_masked(
                 &mut states[lane],
                 &mut windows[lane],
                 incoming[lane] as u8,
-                validity[validity_idx] == 0,
+                validity[lane] == 0,
                 k,
                 rc,
                 callback,
@@ -578,5 +563,15 @@ mod test {
                 assert_eq!(simd, scalar, "k={k} seq={:?}", case);
             }
         }
+    }
+
+    #[test]
+    fn simd_matches_scalar_ambiguous_on_aligned_validity_layout_regression() {
+        let seq = PackedNSeqVec::from_ascii(b"ACGTACGTNNACGTACGTACGTNNACGTACGTAC");
+        let mut scalar = collect_scalar_ambiguous(&seq, 11, true);
+        let mut simd = collect_simd_ambiguous(&seq, 11, true);
+        scalar.sort_unstable();
+        simd.sort_unstable();
+        assert_eq!(simd, scalar);
     }
 }
