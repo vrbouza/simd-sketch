@@ -320,7 +320,7 @@ impl BucketSketch {
         assert_eq!(self.b, other.b);
         let both_empty = self.both_empty(other);
         // if both_empty > 0 {
-        // debug!("Both empty: {}", both_empty);
+        // //debug!("Both empty: {}", both_empty);
         // }
         match (&self.buckets, &other.buckets) {
             (BitSketch::B32(a), BitSketch::B32(b)) => Self::inner_similarity(a, b, both_empty),
@@ -545,7 +545,7 @@ impl Sketcher {
                     .map(|[l, r]| (l != r) as usize)
                     .sum::<usize>();
 
-                debug!("Deduplicated from {old_len} to {new_len}");
+                //debug!("Deduplicated from {old_len} to {new_len}");
                 if bound == u32::MAX || new_len >= self.params.s {
                     out.dedup();
                     out.resize(self.params.s, u32::MAX);
@@ -571,12 +571,12 @@ impl Sketcher {
 
             let new_factor = factor + factor.div_ceil(4);
             let prev = self.factor.fetch_max(new_factor, Relaxed);
-            debug!(
-                "Found only {:>10} of {:>10} ({:>6.3}%)) Increasing factor from {factor} to {new_factor} (was already {prev})",
-                out.len(),
-                self.params.s,
-                out.len() as f32 / self.params.s as f32,
-            );
+            //debug!(
+            //     "Found only {:>10} of {:>10} ({:>6.3}%)) Increasing factor from {factor} to {new_factor} (was already {prev})",
+            //     out.len(),
+            //     self.params.s,
+            //     out.len() as f32 / self.params.s as f32,
+            // );
         }
     }
 
@@ -595,7 +595,7 @@ impl Sketcher {
             out.truncate(self.params.s);
             let l2 = out.len();
             let bound = out.get(self.params.s - 1).copied().unwrap_or(u32::MAX);
-            debug!("Len before {l0} => dedup {l1} => truncate {l2}. New bound {bound}");
+            //debug!("Len before {l0} => dedup {l1} => truncate {l2}. New bound {bound}");
             bound
         });
 
@@ -603,7 +603,7 @@ impl Sketcher {
         out.sort_unstable();
         out.dedup();
         let l1 = out.len();
-        debug!("Len before {l0} => after {l1}.");
+        //debug!("Len before {l0} => after {l1}.");
         out.resize(self.params.s, u32::MAX);
 
         if log::log_enabled!(log::Level::Debug) {
@@ -666,12 +666,12 @@ impl Sketcher {
                 let factor = self.factor.load(Relaxed);
                 let bound = (target as u128 * factor as u128 / 10 as u128).min(u32::MAX as u128) as u32;
 
-                debug!(
-                    "n {n:>10} s {} cnt {} target {target:>10} factor {factor:>3} bound {bound:>10} ({:>6.3}% * u32::MAX)",
-                    self.params.s,
-                    self.params.count,
-                    bound as f32 / u32::MAX as f32 * 100.0,
-                );
+                //debug!(
+                //     "n {n:>10} s {} cnt {} target {target:>10} factor {factor:>3} bound {bound:>10} ({:>6.3}% * u32::MAX)",
+                //     self.params.s,
+                //     self.params.count,
+                //     bound as f32 / u32::MAX as f32 * 100.0,
+                // );
 
                 self.collect_up_to_bound(seqs, bound, out, usize::MAX, |_| 0);
 
@@ -726,7 +726,7 @@ impl Sketcher {
                                 }
                             }
                         }
-                        // debug!(
+                        // //debug!(
                         //     "Hashset size: {} ({:>5.2}%)",
                         //     seen.len(),
                         //     seen.len() as f32 / out.len() as f32 * 100.0
@@ -739,10 +739,10 @@ impl Sketcher {
                     }
                     if bound == u32::MAX || num_empty == 0 {
                         if num_empty > 0 {
-                            debug!("Found {num_empty} empty buckets.");
+                            //debug!("Found {num_empty} empty buckets.");
                         }
                         let empty = if num_empty > 0 && self.params.filter_empty {
-                            debug!("Found {num_empty} empty buckets. Storing bitmask.");
+                            //debug!("Found {num_empty} empty buckets. Storing bitmask.");
                             buckets
                                 .chunks(64)
                                 .map(|xs| {
@@ -761,7 +761,7 @@ impl Sketcher {
 
                         // Reduce buckets mod m.
                         buckets.iter_mut().for_each(|x| *x =  m.fastdiv(*x) as u32);
-                        log::debug!("Average sketch value: {}", buckets.iter().sum::<u32>() as f32 / self.params.s as f32);
+                        // log::debug!("Average sketch value: {}", buckets.iter().sum::<u32>() as f32 / self.params.s as f32);
                         return BucketSketch {
                             rc: self.params.rc,
                             k: self.params.k,
@@ -779,12 +779,12 @@ impl Sketcher {
 
                 let new_factor = factor + factor.div_ceil(4);
                 let prev = self.factor.fetch_max(new_factor, Relaxed);
-                debug!(
-                    "Found only {:>10} of {:>10} ({:>6.3}%, {num_empty:>5} empty) Increasing factor from {factor} to {new_factor} (was already {prev})",
-                    out.len(),
-                    self.params.s,
-                    out.len() as f32 / self.params.s as f32 * 100.,
-                );
+                //debug!(
+                //     "Found only {:>10} of {:>10} ({:>6.3}%, {num_empty:>5} empty) Increasing factor from {factor} to {new_factor} (was already {prev})",
+                //     out.len(),
+                //     self.params.s,
+                //     out.len() as f32 / self.params.s as f32 * 100.,
+                // );
             }
         })
     }
@@ -801,7 +801,7 @@ impl Sketcher {
         }
         let mut cc = cc.into_iter().collect::<Vec<_>>();
         cc.sort_unstable();
-        debug!("Counts: {:?}", cc);
+        //debug!("Counts: {:?}", cc);
 
         // for bottom sketch:
         // - the i'th smallest value is roughly i * MAX/(n+1).
@@ -833,18 +833,18 @@ impl Sketcher {
                 .copied()
                 .collect::<Vec<_>>();
             xs.sort_unstable();
-            // debug!("Hashes {xs:?}");
+            // //debug!("Hashes {xs:?}");
             xs[xs.len() / 2] as f64
         };
-        debug!("Expected  hash {expected_hash:>11.2}");
-        debug!("Average   hash {average_hash:>11.2}");
-        debug!("Harmonic  hash {harmonic_hash:>11.2}");
-        debug!("Harmonic2 hash {harmonic2_hash:>11.2}");
-        debug!("Median    hash {median_hash:>11.2}");
-        debug!("Average ratio   {:>7.4}", average_hash / expected_hash);
-        debug!("Harmonic ratio  {:>7.4}", harmonic_hash / expected_hash);
-        debug!("Harmonic2 ratio {:>7.4}", harmonic2_hash / expected_hash);
-        debug!("Median ratio    {:>7.4}", median_hash / expected_hash);
+        //debug!("Expected  hash {expected_hash:>11.2}");
+        //debug!("Average   hash {average_hash:>11.2}");
+        //debug!("Harmonic  hash {harmonic_hash:>11.2}");
+        //debug!("Harmonic2 hash {harmonic2_hash:>11.2}");
+        //debug!("Median    hash {median_hash:>11.2}");
+        //debug!("Average ratio   {:>7.4}", average_hash / expected_hash);
+        //debug!("Harmonic ratio  {:>7.4}", harmonic_hash / expected_hash);
+        //debug!("Harmonic2 ratio {:>7.4}", harmonic2_hash / expected_hash);
+        //debug!("Median ratio    {:>7.4}", median_hash / expected_hash);
         let average_kmers = u32::MAX as f64 / average_hash;
         let harmonic_kmers = u32::MAX as f64 / harmonic_hash;
         let harmonic2_kmers = u32::MAX as f64 / harmonic2_hash;
@@ -854,10 +854,10 @@ impl Sketcher {
         let harmonic_coverage = real_kmers / harmonic_kmers;
         let harmonic2_coverage = real_kmers / harmonic2_kmers;
         let median_coverage = real_kmers / median_kmers;
-        debug!("Average coverage   {average_coverage:>7.4}");
-        debug!("Harmonic coverage  {harmonic_coverage:>7.4}");
-        debug!("Harmonic2 coverage {harmonic2_coverage:>7.4}");
-        debug!("Median coverage    {median_coverage:>7.4}");
+        //debug!("Average coverage   {average_coverage:>7.4}");
+        //debug!("Harmonic coverage  {harmonic_coverage:>7.4}");
+        //debug!("Harmonic2 coverage {harmonic2_coverage:>7.4}");
+        //debug!("Median coverage    {median_coverage:>7.4}");
     }
 
     /// Collect all values `<= bound`.
@@ -883,11 +883,11 @@ impl Sketcher {
                 collect_impl(&mut bound, hashes, out, batch_size, &mut callback, it);
             }
         }
-        debug!(
-            "Collect up to {bound:>10}: {:>9} ({:>6.3}% of all kmers)",
-            out.len(),
-            out.len() as f32 / self.num_kmers(seqs) as f32 * 100.0
-        );
+        //debug!(
+        //     "Collect up to {bound:>10}: {:>9} ({:>6.3}% of all kmers)",
+        //     out.len(),
+        //     out.len() as f32 / self.num_kmers(seqs) as f32 * 100.0
+        // );
     }
 }
 
