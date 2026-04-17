@@ -545,12 +545,7 @@ impl Sketcher {
             }
             HashMode::NtHash64 => {
                 for &seq in seqs {
-                    let bases = seq.encoded_bases();
-                    let mut it =
-                        nthash64::NtHashIterator::new(bases, self.params.k, self.params.rc);
-                    for hash in &mut it {
-                        callback(hash);
-                    }
+                    seq.nthash64_hashes(self.params.k, self.params.rc, &mut callback);
                 }
             }
         }
@@ -585,7 +580,7 @@ enum EitherHasher<'a> {
 pub trait Sketchable: Copy {
     fn len(self) -> usize;
     fn legacy_hashes<H: KmerHasher>(self, hasher: &H) -> Vec<u32>;
-    fn encoded_bases(self) -> Vec<u8>;
+    fn nthash64_hashes(self, k: usize, rc: bool, callback: &mut dyn FnMut(u64));
 }
 
 impl Sketchable for &[u8] {
@@ -597,8 +592,8 @@ impl Sketchable for &[u8] {
         hasher.hash_kmers_scalar(self).collect()
     }
 
-    fn encoded_bases(self) -> Vec<u8> {
-        self.iter().map(|b| encode_base(*b)).collect()
+    fn nthash64_hashes(self, k: usize, rc: bool, callback: &mut dyn FnMut(u64)) {
+        nthash64::for_each_hash_simd(self, k, rc, callback);
     }
 }
 
@@ -611,8 +606,8 @@ impl Sketchable for packed_seq::AsciiSeq<'_> {
         hasher.hash_kmers_scalar(self).collect()
     }
 
-    fn encoded_bases(self) -> Vec<u8> {
-        self.iter_bp().collect()
+    fn nthash64_hashes(self, k: usize, rc: bool, callback: &mut dyn FnMut(u64)) {
+        nthash64::for_each_hash_simd(self, k, rc, callback);
     }
 }
 
@@ -625,8 +620,8 @@ impl Sketchable for packed_seq::PackedSeq<'_> {
         hasher.hash_kmers_scalar(self).collect()
     }
 
-    fn encoded_bases(self) -> Vec<u8> {
-        self.iter_bp().collect()
+    fn nthash64_hashes(self, k: usize, rc: bool, callback: &mut dyn FnMut(u64)) {
+        nthash64::for_each_hash_simd(self, k, rc, callback);
     }
 }
 
@@ -639,23 +634,8 @@ impl<'s> Sketchable for PackedNSeq<'s> {
         hasher.hash_valid_kmers_scalar(self).collect()
     }
 
-    fn encoded_bases(self) -> Vec<u8> {
-        self.seq
-            .iter_bp()
-            .zip(self.ambiguous.iter_bp())
-            .map(|(base, amb)| if amb == 0 { base } else { 5 })
-            .collect()
-    }
-}
-
-fn encode_base(base: u8) -> u8 {
-    let lower = base | 0x20;
-    match lower {
-        b'a' => 0,
-        b'c' => 1,
-        b't' | b'u' => 2,
-        b'g' => 3,
-        _ => 5,
+    fn nthash64_hashes(self, k: usize, rc: bool, callback: &mut dyn FnMut(u64)) {
+        nthash64::for_each_hash_simd_ambiguous(self.seq, self.ambiguous, k, rc, callback);
     }
 }
 
