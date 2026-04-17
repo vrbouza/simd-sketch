@@ -54,3 +54,50 @@ fn nthash64_filtering_keeps_self_distance_zero_with_ambiguous_input() {
     let sketch = sketcher.sketch(seq.as_slice());
     assert_eq!(sketch.mash_distance(&sketch), 0.0);
 }
+
+#[test]
+fn nthash64_bottom_sketch_with_ambiguous_input_is_deterministic() {
+    let seq = PackedNSeqVec::from_ascii(b"NNNNACGTACGTNNNNACGTNACGTACGTNNNN");
+    let sketcher = SketchParams {
+        filter_out_n: true,
+        ..params(HashMode::NtHash64, SketchAlg::Bottom, 0)
+    }
+    .build();
+
+    let sketch_a = sketcher.sketch(seq.as_slice());
+    let sketch_b = sketcher.sketch(seq.as_slice());
+
+    let Sketch::BottomSketch(sketch_a) = sketch_a else {
+        panic!("expected bottom sketch")
+    };
+    let Sketch::BottomSketch(sketch_b) = sketch_b else {
+        panic!("expected bottom sketch")
+    };
+    assert_eq!(sketch_a.bottom, sketch_b.bottom);
+}
+
+#[test]
+fn nthash64_bucket_sketch_with_ambiguous_input_is_deterministic() {
+    let seq = PackedNSeqVec::from_ascii(b"NNNNACGTACGTNNNNACGTNACGTACGTNNNN");
+    let sketcher = SketchParams {
+        filter_out_n: true,
+        ..params(HashMode::NtHash64, SketchAlg::Bucket, 64)
+    }
+    .build();
+
+    let sketch_a = sketcher.sketch(seq.as_slice());
+    let sketch_b = sketcher.sketch(seq.as_slice());
+
+    let Sketch::BucketSketch(sketch_a) = sketch_a else {
+        panic!("expected bucket sketch")
+    };
+    let Sketch::BucketSketch(sketch_b) = sketch_b else {
+        panic!("expected bucket sketch")
+    };
+
+    match (&sketch_a.buckets, &sketch_b.buckets) {
+        (BitSketch::B64(a), BitSketch::B64(b)) => assert_eq!(a, b),
+        _ => panic!("expected B64 bucket sketch"),
+    }
+    assert_eq!(sketch_a.empty, sketch_b.empty);
+}

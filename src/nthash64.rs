@@ -1,6 +1,6 @@
 use std::{array::from_fn, cmp::Ordering};
 
-use packed_seq::{ChunkIt, Delay, PaddedIt, Seq};
+use packed_seq::{BitSeq, ChunkIt, Delay, PaddedIt, Seq};
 use wide::u32x8;
 
 use crate::nthash_tables;
@@ -22,6 +22,7 @@ fn swapbits3263(v: u64) -> u64 {
     v ^ ((x << 32) | (x << 63))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub struct NtHashIterator {
     k: usize,
@@ -33,6 +34,7 @@ pub struct NtHashIterator {
     seq_len: usize,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl NtHashIterator {
     pub fn new(seq: Vec<u8>, k: usize, rc: bool) -> Self {
         let seq_len = seq.len();
@@ -187,6 +189,7 @@ fn lane_valid_lengths(lane_len: usize, padding: usize) -> [usize; 8] {
 struct LaneState {
     count: usize,
     head: usize,
+    primed: bool,
     fh: u64,
     rh: u64,
 }
@@ -196,6 +199,7 @@ impl LaneState {
         Self {
             count: 0,
             head: 0,
+            primed: false,
             fh: 0,
             rh: 0,
         }
@@ -217,20 +221,20 @@ pub fn for_each_hash_simd<'s>(
 
 pub fn for_each_hash_simd_ambiguous<'s>(
     seq: impl Seq<'s>,
-    ambiguous: impl Seq<'s>,
+    ambiguous: BitSeq<'s>,
     k: usize,
     rc: bool,
     callback: &mut dyn FnMut(u64),
 ) {
-    let bases: Vec<u8> = seq
-        .iter_bp()
-        .zip(ambiguous.iter_bp())
-        .map(|(base, amb)| if amb == 0 { base } else { 5 })
-        .collect();
-    let mut it = NtHashIterator::new(bases, k, rc);
-    for hash in &mut it {
-        callback(hash);
+    if k == 0 {
+        return;
     }
+    let bases = seq.par_iter_bp_delayed(k, Delay(k - 1));
+    let validity = ambiguous
+        .iter_kmer_ambiguity(k)
+        .map(|x| x as u32)
+        .collect::<Vec<_>>();
+    stream_hashes_from_pairs_ambiguous(bases, validity, k, rc, callback);
 }
 
 fn stream_hashes_from_pairs<I>(
@@ -276,6 +280,58 @@ fn warmup_base(state: &mut LaneState, window: &mut [u8], base: u8) {
     state.count += 1;
 }
 
+fn lane_offsets(valid_lens: [usize; 8]) -> [usize; 8] {
+    let mut offsets = [0; 8];
+    let mut sum = 0;
+    for lane in 0..8 {
+        offsets[lane] = sum;
+        sum += valid_lens[lane];
+    }
+    offsets
+}
+
+fn stream_hashes_from_pairs_ambiguous<I>(
+    mut pairs: PaddedIt<I>,
+    validity: Vec<u32>,
+    k: usize,
+    rc: bool,
+    callback: &mut dyn FnMut(u64),
+) where
+    I: ChunkIt<(u32x8, u32x8)>,
+{
+    let mut states: [LaneState; 8] = from_fn(|_| LaneState::new());
+    let mut windows = vec![vec![0_u8; k]; 8];
+    pairs.advance_with(k.saturating_sub(1), |(incoming, _outgoing)| {
+        let incoming = incoming.to_array();
+        for lane in 0..8 {
+            warmup_base(&mut states[lane], &mut windows[lane], incoming[lane] as u8);
+        }
+    });
+
+    let lane_len = pairs.it.len();
+    let valid_lens = lane_valid_lengths(lane_len, pairs.padding);
+    let offsets = lane_offsets(valid_lens);
+
+    for (step, (incoming, _outgoing)) in pairs.it.enumerate() {
+        let incoming = incoming.to_array();
+        for lane in 0..8 {
+            if step >= valid_lens[lane] {
+                continue;
+            }
+            let validity_idx = offsets[lane] + step;
+            process_base_masked(
+                &mut states[lane],
+                &mut windows[lane],
+                incoming[lane] as u8,
+                validity[validity_idx] == 0,
+                k,
+                rc,
+                callback,
+            );
+        }
+    }
+}
+
 fn process_base(
     state: &mut LaneState,
     window: &mut [u8],
@@ -288,9 +344,10 @@ fn process_base(
         window[state.count] = base;
         state.count += 1;
         if state.count == k {
-            let (fh, rh) = init_hashes(window, k, rc);
+            let (fh, rh) = init_hashes_ring(window, 0, k, rc);
             state.fh = fh;
             state.rh = rh.unwrap_or(0);
+            state.primed = true;
             callback(rh.map_or(fh, |rev| fh.min(rev)));
         }
         return;
@@ -311,6 +368,84 @@ fn process_base(
     }
 }
 
+fn process_base_masked(
+    state: &mut LaneState,
+    window: &mut [u8],
+    base: u8,
+    valid: bool,
+    k: usize,
+    rc: bool,
+    callback: &mut dyn FnMut(u64),
+) {
+    if state.count < k {
+        window[state.count] = base;
+        state.count += 1;
+        if state.count == k {
+            if valid {
+                let (fh, rh) = init_hashes_ring(window, 0, k, rc);
+                state.fh = fh;
+                state.rh = rh.unwrap_or(0);
+                state.primed = true;
+                callback(rh.map_or(fh, |rev| fh.min(rev)));
+            } else {
+                state.primed = false;
+            }
+        }
+        return;
+    }
+
+    let old_base = window[state.head];
+    window[state.head] = base;
+    state.head += 1;
+    if state.head == k {
+        state.head = 0;
+    }
+
+    if !valid {
+        state.primed = false;
+        return;
+    }
+
+    if !state.primed {
+        let (fh, rh) = init_hashes_ring(window, state.head, k, rc);
+        state.fh = fh;
+        state.rh = rh.unwrap_or(0);
+        state.primed = true;
+        callback(rh.map_or(fh, |rev| fh.min(rev)));
+        return;
+    }
+
+    state.fh = roll_hash(state.fh, old_base, base, k);
+    if rc {
+        state.rh = roll_hash_rc(state.rh, old_base, base, k);
+        callback(state.fh.min(state.rh));
+    } else {
+        callback(state.fh);
+    }
+}
+
+fn init_hashes_ring(window: &[u8], head: usize, k: usize, rc: bool) -> (u64, Option<u64>) {
+    if head == 0 {
+        return init_hashes(window, k, rc);
+    }
+    let mut fh = 0;
+    for offset in 0..k {
+        let base = window[(head + offset) % k];
+        fh = hash_push(fh, base);
+    }
+    let rh = if rc {
+        let mut rh = 0;
+        for offset in (0..k).rev() {
+            let base = window[(head + offset) % k];
+            rh = hash_push(rh, rc_base(base));
+        }
+        Some(rh)
+    } else {
+        None
+    };
+    (fh, rh)
+}
+
 #[cfg(test)]
 mod test {
     use packed_seq::{PackedNSeqVec, PackedSeqVec, SeqVec};
@@ -321,6 +456,29 @@ mod test {
         let mut out = vec![];
         for_each_hash_simd(seq.as_slice(), k, rc, &mut |h| out.push(h));
         out
+    }
+
+    fn collect_simd_ambiguous(seq: &PackedNSeqVec, k: usize, rc: bool) -> Vec<u64> {
+        let mut out = vec![];
+        for_each_hash_simd_ambiguous(
+            seq.as_slice().seq,
+            seq.as_slice().ambiguous,
+            k,
+            rc,
+            &mut |h| out.push(h),
+        );
+        out
+    }
+
+    fn collect_scalar_ambiguous(seq: &PackedNSeqVec, k: usize, rc: bool) -> Vec<u64> {
+        let bases: Vec<u8> = seq
+            .as_slice()
+            .seq
+            .iter_bp()
+            .zip(seq.as_slice().ambiguous.iter_bp())
+            .map(|(base, amb)| if amb == 0 { base } else { 5 })
+            .collect();
+        NtHashIterator::new(bases, k, rc).collect()
     }
 
     #[test]
@@ -348,22 +506,77 @@ mod test {
     #[test]
     fn simd_matches_scalar_with_ambiguous_bases() {
         let seq = PackedNSeqVec::from_ascii(b"ACGTNNNNACGTACGTNNNNACGT");
-        let bases: Vec<u8> = seq
-            .as_slice()
-            .seq
-            .iter_bp()
-            .zip(seq.as_slice().ambiguous.iter_bp())
-            .map(|(base, amb)| if amb == 0 { base } else { 5 })
-            .collect();
-        let scalar = NtHashIterator::new(bases, 5, true).collect::<Vec<_>>();
-        let mut simd = vec![];
-        for_each_hash_simd_ambiguous(
-            seq.as_slice().seq,
-            seq.as_slice().ambiguous,
-            5,
-            true,
-            &mut |h| simd.push(h),
-        );
+        let scalar = collect_scalar_ambiguous(&seq, 5, true);
+        let simd = collect_simd_ambiguous(&seq, 5, true);
         assert_eq!(simd, scalar);
+    }
+
+    #[test]
+    fn simd_matches_scalar_ambiguous_forward_restart_cases() {
+        let cases: &[&[u8]] = &[
+            b"NACGTACGTACGT",
+            b"ACGTACGTACGTN",
+            b"ACGTNACGTACGT",
+            b"ACGTNNNNACGTACGT",
+            b"NNNNACGTACGTNNNN",
+            b"ACGTNACGNACGTNACGT",
+            b"ACGTNNAC",
+            b"NNNNNN",
+            b"ACGT",
+            b"ACGTN",
+        ];
+
+        for &case in cases {
+            let seq = PackedNSeqVec::from_ascii(case);
+            let mut scalar = collect_scalar_ambiguous(&seq, 5, false);
+            let mut simd = collect_simd_ambiguous(&seq, 5, false);
+            scalar.sort_unstable();
+            simd.sort_unstable();
+            assert_eq!(simd, scalar, "seq={:?}", case);
+        }
+    }
+
+    #[test]
+    fn simd_matches_scalar_ambiguous_canonical_restart_cases() {
+        let cases: &[&[u8]] = &[
+            b"NACGTACGTACGT",
+            b"ACGTACGTACGTN",
+            b"ACGTNACGTACGT",
+            b"ACGTNNNNACGTACGT",
+            b"NNNNACGTACGTNNNN",
+            b"ACGTNACGNACGTNACGT",
+            b"ACGTNNAC",
+            b"NNNNNN",
+            b"ACGT",
+            b"ACGTN",
+        ];
+
+        for &case in cases {
+            let seq = PackedNSeqVec::from_ascii(case);
+            let mut scalar = collect_scalar_ambiguous(&seq, 5, true);
+            let mut simd = collect_simd_ambiguous(&seq, 5, true);
+            scalar.sort_unstable();
+            simd.sort_unstable();
+            assert_eq!(simd, scalar, "seq={:?}", case);
+        }
+    }
+
+    #[test]
+    fn simd_matches_scalar_ambiguous_length_edge_cases() {
+        for k in [3, 5, 7] {
+            for case in [
+                b"AN".as_slice(),
+                b"ACG".as_slice(),
+                b"ACGTN".as_slice(),
+                b"NNNNN".as_slice(),
+            ] {
+                let seq = PackedNSeqVec::from_ascii(case);
+                let mut scalar = collect_scalar_ambiguous(&seq, k, true);
+                let mut simd = collect_simd_ambiguous(&seq, k, true);
+                scalar.sort_unstable();
+                simd.sort_unstable();
+                assert_eq!(simd, scalar, "k={k} seq={:?}", case);
+            }
+        }
     }
 }
