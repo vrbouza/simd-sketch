@@ -7,11 +7,10 @@ use std::{
 
 use clap::Parser;
 use indicatif::ParallelProgressIterator;
-use itertools::Itertools;
 use log::info;
-use packed_seq::{PackedNSeqVec, PackedSeqVec, SeqVec};
+use packed_seq::Seq;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use simd_sketch::{BitSketch, HashMode, Sketch, SketchParams};
+use simd_sketch::{BitSketch, DnaInputOptions, HashMode, Sketch, SketchParams, load_dna_file};
 
 /// Compute the sketch distance between two fasta files.
 #[derive(clap::Parser)]
@@ -27,6 +26,8 @@ enum Command {
     Sketch {
         #[command(flatten)]
         params: SketchParams,
+        #[command(flatten)]
+        input: DnaInputOptions,
         /// Paths to (directories of) (gzipped) fasta files.
         paths: Vec<PathBuf>,
         #[arg(long, short = 'j')]
@@ -38,6 +39,8 @@ enum Command {
     Dist {
         #[command(flatten)]
         params: SketchParams,
+        #[command(flatten)]
+        input: DnaInputOptions,
         /// First input fasta file or .ssketch file.
         path_a: PathBuf,
         /// Second input fasta file or .ssketch file.
@@ -49,6 +52,8 @@ enum Command {
     Triangle {
         #[command(flatten)]
         params: SketchParams,
+        #[command(flatten)]
+        input: DnaInputOptions,
         /// Paths to (directories of) (gzipped) fasta files or .ssketch files.
         /// If <path>.ssketch exists, it is automatically used.
         paths: Vec<PathBuf>,
@@ -66,6 +71,8 @@ enum Command {
         // Sketch args
         #[command(flatten)]
         params: SketchParams,
+        #[command(flatten)]
+        input: DnaInputOptions,
         /// Paths to directory of (gzipped) fasta files.
         #[arg(long)]
         targets: Vec<PathBuf>,
@@ -245,6 +252,13 @@ fn main() {
         Command::Triangle { save_sketches, .. } => *save_sketches,
     };
 
+    let input = match &args.command {
+        Command::Sketch { input, .. }
+        | Command::Dist { input, .. }
+        | Command::Triangle { input, .. }
+        | Command::Classify { input, .. } => *input,
+    };
+
     let q = paths.len();
 
     let sketcher = params.build();
@@ -313,34 +327,13 @@ fn main() {
                 return read_sketch(&ssketch_path);
             }
 
-            let mut reader = needletail::parse_fastx_file(&path).unwrap();
-
-            let mut sketch;
-            if params.filter_out_n {
-                let mut ranges = vec![];
-                let mut seq = PackedNSeqVec::default();
-                let mut size = 0;
-                while let Some(r) = reader.next() {
-                    let range = seq.push_ascii(&r.unwrap().seq());
-                    size += range.len();
-                    ranges.push(range);
-                }
-                total_bytes.fetch_add(size, Relaxed);
-                let slices = ranges.into_iter().map(|r| seq.slice(r)).collect_vec();
-                sketch = sketcher.sketch_seqs(&slices);
+            let seq = load_dna_file(path, &input);
+            total_bytes.fetch_add(Seq::len(&seq.as_slice().seq), Relaxed);
+            let mut sketch = if params.filter_out_n {
+                sketcher.sketch(seq.as_slice())
             } else {
-                let mut ranges = vec![];
-                let mut seq = PackedSeqVec::default();
-                let mut size = 0;
-                while let Some(r) = reader.next() {
-                    let range = seq.push_ascii(&r.unwrap().seq());
-                    size += range.len();
-                    ranges.push(range);
-                }
-                total_bytes.fetch_add(size, Relaxed);
-                let slices = ranges.into_iter().map(|r| seq.slice(r)).collect_vec();
-                sketch = sketcher.sketch_seqs(&slices);
-            }
+                sketcher.sketch(seq.as_slice().seq)
+            };
             num_sketched.fetch_add(1, Relaxed);
 
             if save_sketches {
@@ -392,7 +385,7 @@ fn main() {
         return;
     }
     if let Command::Classify { reads, .. } = &args.command {
-        simd_sketch::classify::classify(&sketches, reads);
+        simd_sketch::classify::classify(&sketches, reads, &input);
         return;
     }
 

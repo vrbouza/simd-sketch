@@ -1,16 +1,19 @@
+pub mod bloom_filter;
 pub mod classify;
 mod intrinsics;
 mod nthash64;
 mod nthash_tables;
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    cmp::Ordering,
     mem::size_of,
+    path::Path,
     sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
+use bloom_filter::KmerFilter;
 use itertools::Itertools;
-use packed_seq::{PackedNSeq, Seq};
+use packed_seq::{PackedNSeq, PackedNSeqVec, Seq};
 use seq_hash::KmerHasher;
 
 type FwdNtHasher = seq_hash::NtHasher<false, 1>;
@@ -126,11 +129,18 @@ pub struct SketchParams {
     #[arg(long, default_value_t = 0)]
     pub count: usize,
     #[arg(short, long, default_value_t = 1)]
+    /// Estimated sequencing coverage for bottom sketches; ignored for bucket sketches.
     pub coverage: usize,
     #[arg(skip = true)]
     pub filter_empty: bool,
     #[arg(long)]
     pub filter_out_n: bool,
+}
+
+#[derive(clap::Args, Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct DnaInputOptions {
+    #[arg(long, default_value_t = 0)]
+    pub min_qual: u8,
 }
 
 pub struct Sketcher {
@@ -344,6 +354,17 @@ impl Sketcher {
         self.sketch_seqs(&[seq])
     }
 
+    pub fn sketch_files<P: AsRef<Path>>(&self, paths: &[P], input: &DnaInputOptions) -> Sketch {
+        let seqs = load_dna_files(paths, input);
+        if self.params.filter_out_n {
+            let slices = seqs.iter().map(|x| x.as_slice()).collect_vec();
+            self.sketch_seqs(&slices)
+        } else {
+            let slices = seqs.iter().map(|x| x.as_slice().seq).collect_vec();
+            self.sketch_seqs(&slices)
+        }
+    }
+
     pub fn sketch_seqs(&self, seqs: &[impl Sketchable]) -> Sketch {
         match self.params.alg {
             SketchAlg::Bottom | SketchAlg::Bottom2 | SketchAlg::Bottom3 => {
@@ -409,7 +430,6 @@ impl Sketcher {
     fn bucket_sketch(&self, seqs: &[impl Sketchable]) -> BucketSketch {
         let n = self.num_kmers(seqs);
         let max_hash = self.max_hash();
-        let mut out = vec![];
         let mut buckets = vec![max_hash; self.params.s];
         if n == 0 {
             let empty = if self.params.filter_empty {
@@ -433,79 +453,54 @@ impl Sketcher {
                 empty,
             };
         }
-        loop {
-            buckets.fill(max_hash);
-            let target = (max_hash as u128).saturating_mul(self.params.s as u128)
-                / (n / self.params.coverage.max(1)).max(1) as u128;
-            let factor = self.factor.load(Relaxed);
-            let bound = (target.saturating_mul(factor as u128) / 10).min(max_hash as u128) as u64;
-            self.collect_up_to_bound(seqs, bound, &mut out, usize::MAX, |_| 0);
-            let mut seen = HashMap::with_capacity(4 * self.params.s.max(1));
-            for &hash in &out {
+        if self.params.count <= 1 {
+            self.for_each_hash(seqs, |hash| {
                 let bucket = (hash % self.params.s as u64) as usize;
-                let min = &mut buckets[bucket];
-                if self.params.count <= 1 {
-                    *min = (*min).min(hash);
-                    continue;
+                buckets[bucket] = buckets[bucket].min(hash);
+            });
+        } else {
+            let mut filter = KmerFilter::new(self.params.count);
+            filter.init();
+            self.for_each_hash(seqs, |hash| {
+                if filter.filter(hash) == Ordering::Equal {
+                    let bucket = (hash % self.params.s as u64) as usize;
+                    buckets[bucket] = buckets[bucket].min(hash);
                 }
-                if hash > *min {
-                    continue;
-                }
-                if hash == *min {
-                    continue;
-                }
-                match seen.entry(hash) {
-                    Entry::Vacant(e) => {
-                        e.insert(1usize);
-                    }
-                    Entry::Occupied(mut e) => {
-                        let cnt = e.get_mut();
-                        *cnt += 1;
-                        if *cnt == self.params.count {
-                            e.remove();
-                            *min = hash;
-                        }
-                    }
-                }
-            }
-            let num_empty = buckets.iter().filter(|x| **x == max_hash).count();
-            if bound == max_hash || num_empty == 0 {
-                let empty = if num_empty > 0 && self.params.filter_empty {
-                    buckets
-                        .chunks(64)
-                        .map(|xs| {
-                            xs.iter()
-                                .enumerate()
-                                .fold(0u64, |bits, (i, x)| bits | (((*x == max_hash) as u64) << i))
-                        })
-                        .collect()
+            });
+        }
+        let num_empty = buckets.iter().filter(|x| **x == max_hash).count();
+        let empty = if num_empty > 0 && self.params.filter_empty {
+            buckets
+                .chunks(64)
+                .map(|xs| {
+                    xs.iter()
+                        .enumerate()
+                        .fold(0u64, |bits, (i, x)| bits | (((*x == max_hash) as u64) << i))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let divisor = self.params.s as u64;
+        let reduced = buckets
+            .iter()
+            .map(|x| {
+                if *x == max_hash {
+                    max_hash
                 } else {
-                    vec![]
-                };
-                let divisor = self.params.s as u64;
-                let reduced = buckets
-                    .iter()
-                    .map(|x| {
-                        if *x == max_hash {
-                            max_hash
-                        } else {
-                            *x / divisor
-                        }
-                    })
-                    .collect_vec();
-                return BucketSketch {
-                    hash_mode: self.params.hash_mode,
-                    rc: self.params.rc,
-                    k: self.params.k,
-                    b: self.effective_b(),
-                    seed: self.params.seed,
-                    count: self.params.count,
-                    empty,
-                    buckets: BitSketch::new(self.effective_b(), &reduced),
-                };
-            }
-            let new_factor = factor + factor.div_ceil(4);
-            self.factor.fetch_max(new_factor, Relaxed);
+                    *x / divisor
+                }
+            })
+            .collect_vec();
+        BucketSketch {
+            hash_mode: self.params.hash_mode,
+            rc: self.params.rc,
+            k: self.params.k,
+            b: self.effective_b(),
+            seed: self.params.seed,
+            count: self.params.count,
+            empty,
+            buckets: BitSketch::new(self.effective_b(), &reduced),
         }
     }
 
@@ -639,10 +634,30 @@ impl<'s> Sketchable for PackedNSeq<'s> {
     }
 }
 
+pub fn load_dna_file(path: impl AsRef<Path>, input: &DnaInputOptions) -> PackedNSeqVec {
+    let path = path.as_ref();
+    if input.min_qual == 0 {
+        PackedNSeqVec::from_fastx(path)
+    } else {
+        PackedNSeqVec::from_fastq_with_quality(path, input.min_qual)
+    }
+}
+
+pub fn load_dna_files<P: AsRef<Path>>(paths: &[P], input: &DnaInputOptions) -> Vec<PackedNSeqVec> {
+    paths
+        .iter()
+        .map(|path| load_dna_file(path, input))
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use packed_seq::{PackedNSeqVec, PackedSeqVec, SeqVec};
+    use packed_seq::{BitSeqVec, PackedNSeqVec, PackedSeqVec, SeqVec};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn legacy_and_nt64_self_distance_zero() {
@@ -689,5 +704,93 @@ mod test {
             _ => unreachable!(),
         };
         assert!(sketch.bottom.iter().any(|x| *x != u64::MAX));
+    }
+
+    #[test]
+    fn bucket_sketch_ignores_coverage_even_with_count_filtering() {
+        let seq = PackedSeqVec::from_ascii(b"ACGTACGTACGTACGT");
+        let slices = [seq.as_slice(), seq.as_slice(), seq.as_slice()];
+        let params = SketchParams {
+            alg: SketchAlg::Bucket,
+            hash_mode: HashMode::NtHash64,
+            rc: true,
+            k: 5,
+            s: 16,
+            b: 16,
+            seed: 0,
+            count: 3,
+            coverage: 1,
+            filter_empty: true,
+            filter_out_n: false,
+        };
+        let a = params.build().sketch_seqs(&slices);
+        let b = SketchParams {
+            coverage: 100,
+            ..params
+        }
+        .build()
+        .sketch_seqs(&slices);
+
+        let (Sketch::BucketSketch(a), Sketch::BucketSketch(b)) = (a, b) else {
+            unreachable!()
+        };
+        match (&a.buckets, &b.buckets) {
+            (BitSketch::B16(a), BitSketch::B16(b)) => assert_eq!(a, b),
+            _ => panic!("expected B16 buckets"),
+        }
+        assert_eq!(a.empty, b.empty);
+    }
+
+    #[test]
+    fn load_dna_file_uses_quality_aware_loader() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("simd_sketch_{unique}.fastq"));
+        fs::write(&path, b"@r1\nACGTACGT\n+\n!!!!!!!!\n").unwrap();
+
+        let raw = load_dna_file(&path, &DnaInputOptions { min_qual: 0 });
+        let filtered = load_dna_file(&path, &DnaInputOptions { min_qual: 20 });
+        let expected_raw = PackedNSeqVec::from_fastx(&path);
+        let expected_filtered = PackedNSeqVec::from_fastq_with_quality(&path, 20);
+        fs::remove_file(&path).unwrap();
+
+        let raw_ambiguous: Vec<_> = raw.as_slice().ambiguous.iter_bp().collect();
+        let filtered_ambiguous: Vec<_> = filtered.as_slice().ambiguous.iter_bp().collect();
+        let expected_raw_ambiguous: Vec<_> = expected_raw.as_slice().ambiguous.iter_bp().collect();
+        let expected_filtered_ambiguous: Vec<_> =
+            expected_filtered.as_slice().ambiguous.iter_bp().collect();
+        assert_eq!(raw_ambiguous, expected_raw_ambiguous);
+        assert_eq!(filtered_ambiguous, expected_filtered_ambiguous);
+    }
+
+    #[test]
+    fn bucket_sketch_counts_only_valid_kmers_with_filter_out_n() {
+        let seq_bases = PackedSeqVec::from_ascii(b"ACGTACGT");
+        let ambiguous = BitSeqVec::from_ascii(b"NNNNACGT");
+        let seq = PackedNSeq {
+            seq: seq_bases.as_slice(),
+            ambiguous: ambiguous.as_slice(),
+        };
+        let sketch = SketchParams {
+            alg: SketchAlg::Bucket,
+            hash_mode: HashMode::NtHash64,
+            rc: true,
+            k: 3,
+            s: 8,
+            b: 16,
+            seed: 0,
+            count: 1,
+            coverage: 25,
+            filter_empty: true,
+            filter_out_n: true,
+        }
+        .build()
+        .sketch(seq);
+        let Sketch::BucketSketch(sketch) = sketch else {
+            unreachable!()
+        };
+        assert!(sketch.empty.iter().any(|x| *x != 0));
     }
 }

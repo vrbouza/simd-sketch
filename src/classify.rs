@@ -2,11 +2,10 @@ use std::{collections::HashMap, path::Path};
 
 use itertools::Itertools;
 use log::info;
-use packed_seq::PackedNSeqVec;
 
-use crate::{BitSketch, Sketch};
+use crate::{BitSketch, DnaInputOptions, Sketch, load_dna_file};
 
-pub fn classify(sketches: &[Sketch], reads: &Path) {
+pub fn classify(sketches: &[Sketch], reads: &Path, input: &DnaInputOptions) {
     let mut params = sketches[0].to_params();
     params.filter_out_n = true;
 
@@ -69,7 +68,7 @@ pub fn classify(sketches: &[Sketch], reads: &Path) {
     info!("Params: {params:?}");
     let sketcher = params.build();
 
-    let seq = PackedNSeqVec::from_fastq_with_quality(reads, 20);
+    let seq = load_dna_file(reads, input);
     let mut read_hashes = vec![];
     sketcher.collect_up_to_bound(
         &[seq.as_slice()],
