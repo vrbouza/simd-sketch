@@ -1,22 +1,29 @@
 pub mod bloom_filter;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod classify;
 mod intrinsics;
 mod nthash64;
 mod nthash_tables;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 use std::{
     cmp::Ordering,
     mem::size_of,
-    path::Path,
     sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
 use bloom_filter::KmerFilter;
 use itertools::Itertools;
-use packed_seq::{PackedNSeq, PackedNSeqVec, Seq};
+#[cfg(not(target_arch = "wasm32"))]
+use packed_seq::PackedNSeqVec;
+use packed_seq::{PackedNSeq, Seq};
+#[cfg(not(target_arch = "wasm32"))]
 use seq_hash::KmerHasher;
 
+#[cfg(not(target_arch = "wasm32"))]
 type FwdNtHasher = seq_hash::NtHasher<false, 1>;
+#[cfg(not(target_arch = "wasm32"))]
 type RcNtHasher = seq_hash::NtHasher<true, 1>;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq, bincode::Encode, bincode::Decode)]
@@ -145,7 +152,9 @@ pub struct DnaInputOptions {
 
 pub struct Sketcher {
     params: SketchParams,
+    #[cfg(not(target_arch = "wasm32"))]
     rc_hasher: RcNtHasher,
+    #[cfg(not(target_arch = "wasm32"))]
     fwd_hasher: FwdNtHasher,
     factor: AtomicU64,
 }
@@ -297,6 +306,10 @@ impl SketchParams {
         if params.hash_mode == HashMode::NtHash64 && params.seed != 0 {
             panic!("NtHash64 does not support non-zero seeds");
         }
+        #[cfg(target_arch = "wasm32")]
+        if params.hash_mode == HashMode::Legacy32 {
+            panic!("Legacy32 is not supported on wasm32 builds");
+        }
         let factor = match params.alg {
             SketchAlg::Bottom | SketchAlg::Bottom2 | SketchAlg::Bottom3 => {
                 params.b = 0;
@@ -306,7 +319,9 @@ impl SketchParams {
         };
         Sketcher {
             params,
+            #[cfg(not(target_arch = "wasm32"))]
             rc_hasher: RcNtHasher::new_with_seed(params.k, params.seed),
+            #[cfg(not(target_arch = "wasm32"))]
             fwd_hasher: FwdNtHasher::new_with_seed(params.k, params.seed),
             factor: AtomicU64::new(factor.max(10)),
         }
@@ -354,6 +369,7 @@ impl Sketcher {
         self.sketch_seqs(&[seq])
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn sketch_files<P: AsRef<Path>>(&self, paths: &[P], input: &DnaInputOptions) -> Sketch {
         let seqs = load_dna_files(paths, input);
         if self.params.filter_out_n {
@@ -513,6 +529,7 @@ impl Sketcher {
 
     fn for_each_hash(&self, seqs: &[impl Sketchable], mut callback: impl FnMut(u64)) {
         match self.params.hash_mode {
+            #[cfg(not(target_arch = "wasm32"))]
             HashMode::Legacy32 => {
                 let hasher = if self.params.rc {
                     EitherHasher::Rc(&self.rc_hasher)
@@ -543,6 +560,8 @@ impl Sketcher {
                     seq.nthash64_hashes(self.params.k, self.params.rc, &mut callback);
                 }
             }
+            #[cfg(target_arch = "wasm32")]
+            HashMode::Legacy32 => panic!("Legacy32 is not supported on wasm32 builds"),
         }
     }
 
@@ -567,6 +586,7 @@ impl Sketcher {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 enum EitherHasher<'a> {
     Rc(&'a RcNtHasher),
     Fwd(&'a FwdNtHasher),
@@ -574,6 +594,7 @@ enum EitherHasher<'a> {
 
 pub trait Sketchable: Copy {
     fn len(self) -> usize;
+    #[cfg(not(target_arch = "wasm32"))]
     fn legacy_hashes<H: KmerHasher>(self, hasher: &H) -> Vec<u32>;
     fn nthash64_hashes(self, k: usize, rc: bool, callback: &mut dyn FnMut(u64));
 }
@@ -583,6 +604,7 @@ impl Sketchable for &[u8] {
         Seq::len(&self)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn legacy_hashes<H: KmerHasher>(self, hasher: &H) -> Vec<u32> {
         hasher.hash_kmers_scalar(self).collect()
     }
@@ -597,6 +619,7 @@ impl Sketchable for packed_seq::AsciiSeq<'_> {
         Seq::len(&self)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn legacy_hashes<H: KmerHasher>(self, hasher: &H) -> Vec<u32> {
         hasher.hash_kmers_scalar(self).collect()
     }
@@ -611,6 +634,7 @@ impl Sketchable for packed_seq::PackedSeq<'_> {
         Seq::len(&self)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn legacy_hashes<H: KmerHasher>(self, hasher: &H) -> Vec<u32> {
         hasher.hash_kmers_scalar(self).collect()
     }
@@ -625,6 +649,7 @@ impl<'s> Sketchable for PackedNSeq<'s> {
         Seq::len(&self.seq)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn legacy_hashes<H: KmerHasher>(self, hasher: &H) -> Vec<u32> {
         hasher.hash_valid_kmers_scalar(self).collect()
     }
@@ -634,6 +659,7 @@ impl<'s> Sketchable for PackedNSeq<'s> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_dna_file(path: impl AsRef<Path>, input: &DnaInputOptions) -> PackedNSeqVec {
     let path = path.as_ref();
     if input.min_qual == 0 {
@@ -643,6 +669,7 @@ pub fn load_dna_file(path: impl AsRef<Path>, input: &DnaInputOptions) -> PackedN
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_dna_files<P: AsRef<Path>>(paths: &[P], input: &DnaInputOptions) -> Vec<PackedNSeqVec> {
     paths
         .iter()
@@ -654,10 +681,10 @@ pub fn load_dna_files<P: AsRef<Path>>(paths: &[P], input: &DnaInputOptions) -> V
 mod test {
     use super::*;
     use packed_seq::{BitSeqVec, PackedNSeqVec, PackedSeqVec, SeqVec};
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::fs;
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn legacy_and_nt64_self_distance_zero() {
@@ -742,6 +769,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_dna_file_uses_quality_aware_loader() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

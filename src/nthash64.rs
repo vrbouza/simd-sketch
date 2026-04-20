@@ -1,7 +1,6 @@
 use std::{array::from_fn, cmp::Ordering};
 
-use packed_seq::{BitSeq, ChunkIt, Delay, PackedSeq, PaddedIt, Seq};
-use wide::u32x8;
+use packed_seq::{BitSeq, ChunkIt, Delay, L, PackedSeq, PaddedIt, Seq, Simd};
 
 use crate::nthash_tables;
 
@@ -180,8 +179,8 @@ fn init_hashes(window: &[u8], k: usize, rc: bool) -> (u64, Option<u64>) {
     (fh, rh)
 }
 
-fn lane_valid_lengths(lane_len: usize, padding: usize) -> [usize; 8] {
-    let total = 8 * lane_len - padding;
+fn lane_valid_lengths(lane_len: usize, padding: usize) -> [usize; L] {
+    let total = L * lane_len - padding;
     from_fn(|lane| total.saturating_sub(lane * lane_len).min(lane_len))
 }
 
@@ -240,13 +239,13 @@ fn stream_hashes_from_pairs<I>(
     rc: bool,
     callback: &mut dyn FnMut(u64),
 ) where
-    I: ChunkIt<(u32x8, u32x8)>,
+    I: ChunkIt<(Simd, Simd)>,
 {
-    let mut states: [LaneState; 8] = from_fn(|_| LaneState::new());
-    let mut windows = vec![vec![0_u8; k]; 8];
+    let mut states: [LaneState; L] = from_fn(|_| LaneState::new());
+    let mut windows = vec![vec![0_u8; k]; L];
     pairs.advance_with(k.saturating_sub(1), |(incoming, _outgoing)| {
         let incoming = incoming.to_array();
-        for lane in 0..8 {
+        for lane in 0..L {
             warmup_base(&mut states[lane], &mut windows[lane], incoming[lane] as u8);
         }
     });
@@ -256,7 +255,7 @@ fn stream_hashes_from_pairs<I>(
 
     for (step, (incoming, _outgoing)) in pairs.it.enumerate() {
         let incoming = incoming.to_array();
-        for lane in 0..8 {
+        for lane in 0..L {
             if step >= valid_lens[lane] {
                 continue;
             }
@@ -283,13 +282,13 @@ fn stream_hashes_from_pairs_ambiguous<I>(
     rc: bool,
     callback: &mut dyn FnMut(u64),
 ) where
-    I: ChunkIt<((u32x8, u32x8), u32x8)>,
+    I: ChunkIt<((Simd, Simd), Simd)>,
 {
-    let mut states: [LaneState; 8] = from_fn(|_| LaneState::new());
-    let mut windows = vec![vec![0_u8; k]; 8];
+    let mut states: [LaneState; L] = from_fn(|_| LaneState::new());
+    let mut windows = vec![vec![0_u8; k]; L];
     pairs.advance_with(k.saturating_sub(1), |((incoming, _outgoing), _validity)| {
         let incoming = incoming.to_array();
-        for lane in 0..8 {
+        for lane in 0..L {
             warmup_base(&mut states[lane], &mut windows[lane], incoming[lane] as u8);
         }
     });
@@ -300,7 +299,7 @@ fn stream_hashes_from_pairs_ambiguous<I>(
     for (step, ((incoming, _outgoing), validity)) in pairs.it.enumerate() {
         let incoming = incoming.to_array();
         let validity = validity.to_array();
-        for lane in 0..8 {
+        for lane in 0..L {
             if step >= valid_lens[lane] {
                 continue;
             }
