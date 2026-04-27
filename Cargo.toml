@@ -49,7 +49,7 @@ seq-hash.git = "https://github.com/rust-seq/seq-hash"
 mem_dbg = "0.3.2"
 
 [patch.crates-io]
-packed-seq = { git = "https://github.com/vrbouza/packed-seq.git", branch = "wasmsim" }
+packed-seq = { git = "https://github.com/vrbouza/packed-seq.git", branch = "wasmsimd" }
 
 [features]
 compression = ["needletail/compression"]
