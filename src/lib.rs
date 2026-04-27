@@ -1,14 +1,16 @@
+mod bloom_filter;
 pub mod classify;
 mod intrinsics;
 mod nthash64;
 mod nthash_tables;
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    cmp::Ordering,
     mem::size_of,
     sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
+use bloom_filter::KmerFilter;
 use itertools::Itertools;
 use packed_seq::{PackedNSeq, Seq};
 use seq_hash::KmerHasher;
@@ -409,7 +411,6 @@ impl Sketcher {
     fn bucket_sketch(&self, seqs: &[impl Sketchable]) -> BucketSketch {
         let n = self.num_kmers(seqs);
         let max_hash = self.max_hash();
-        let mut out = vec![];
         let mut buckets = vec![max_hash; self.params.s];
         if n == 0 {
             let empty = if self.params.filter_empty {
@@ -433,79 +434,57 @@ impl Sketcher {
                 empty,
             };
         }
-        loop {
-            buckets.fill(max_hash);
-            let target = (max_hash as u128).saturating_mul(self.params.s as u128)
-                / (n / self.params.coverage.max(1)).max(1) as u128;
-            let factor = self.factor.load(Relaxed);
-            let bound = (target.saturating_mul(factor as u128) / 10).min(max_hash as u128) as u64;
-            self.collect_up_to_bound(seqs, bound, &mut out, usize::MAX, |_| 0);
-            let mut seen = HashMap::with_capacity(4 * self.params.s.max(1));
-            for &hash in &out {
+
+        if self.params.count <= 1 {
+            self.for_each_hash(seqs, |hash| {
                 let bucket = (hash % self.params.s as u64) as usize;
-                let min = &mut buckets[bucket];
-                if self.params.count <= 1 {
-                    *min = (*min).min(hash);
-                    continue;
+                buckets[bucket] = buckets[bucket].min(hash);
+            });
+        } else {
+            let mut filter = KmerFilter::new(self.params.count);
+            filter.init();
+            self.for_each_hash(seqs, |hash| {
+                if filter.filter(hash) == Ordering::Equal {
+                    let bucket = (hash % self.params.s as u64) as usize;
+                    buckets[bucket] = buckets[bucket].min(hash);
                 }
-                if hash > *min {
-                    continue;
-                }
-                if hash == *min {
-                    continue;
-                }
-                match seen.entry(hash) {
-                    Entry::Vacant(e) => {
-                        e.insert(1usize);
-                    }
-                    Entry::Occupied(mut e) => {
-                        let cnt = e.get_mut();
-                        *cnt += 1;
-                        if *cnt == self.params.count {
-                            e.remove();
-                            *min = hash;
-                        }
-                    }
-                }
-            }
-            let num_empty = buckets.iter().filter(|x| **x == max_hash).count();
-            if bound == max_hash || num_empty == 0 {
-                let empty = if num_empty > 0 && self.params.filter_empty {
-                    buckets
-                        .chunks(64)
-                        .map(|xs| {
-                            xs.iter()
-                                .enumerate()
-                                .fold(0u64, |bits, (i, x)| bits | (((*x == max_hash) as u64) << i))
-                        })
-                        .collect()
+            });
+        }
+
+        let num_empty = buckets.iter().filter(|x| **x == max_hash).count();
+        let empty = if num_empty > 0 && self.params.filter_empty {
+            buckets
+                .chunks(64)
+                .map(|xs| {
+                    xs.iter()
+                        .enumerate()
+                        .fold(0u64, |bits, (i, x)| bits | (((*x == max_hash) as u64) << i))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let divisor = self.params.s as u64;
+        let reduced = buckets
+            .iter()
+            .map(|x| {
+                if *x == max_hash {
+                    max_hash
                 } else {
-                    vec![]
-                };
-                let divisor = self.params.s as u64;
-                let reduced = buckets
-                    .iter()
-                    .map(|x| {
-                        if *x == max_hash {
-                            max_hash
-                        } else {
-                            *x / divisor
-                        }
-                    })
-                    .collect_vec();
-                return BucketSketch {
-                    hash_mode: self.params.hash_mode,
-                    rc: self.params.rc,
-                    k: self.params.k,
-                    b: self.effective_b(),
-                    seed: self.params.seed,
-                    count: self.params.count,
-                    empty,
-                    buckets: BitSketch::new(self.effective_b(), &reduced),
-                };
-            }
-            let new_factor = factor + factor.div_ceil(4);
-            self.factor.fetch_max(new_factor, Relaxed);
+                    *x / divisor
+                }
+            })
+            .collect_vec();
+
+        BucketSketch {
+            hash_mode: self.params.hash_mode,
+            rc: self.params.rc,
+            k: self.params.k,
+            b: self.effective_b(),
+            seed: self.params.seed,
+            count: self.params.count,
+            empty,
+            buckets: BitSketch::new(self.effective_b(), &reduced),
         }
     }
 

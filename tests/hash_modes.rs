@@ -1,4 +1,4 @@
-use packed_seq::{PackedNSeqVec, PackedSeqVec, SeqVec};
+use packed_seq::{BitSeqVec, PackedNSeq, PackedNSeqVec, PackedSeqVec, SeqVec};
 use simd_sketch::{BitSketch, HashMode, Sketch, SketchAlg, SketchParams};
 
 fn params(hash_mode: HashMode, alg: SketchAlg, b: usize) -> SketchParams {
@@ -137,6 +137,130 @@ fn nthash64_multi_record_sketching_is_deterministic() {
     match (&sketch_a.buckets, &sketch_b.buckets) {
         (BitSketch::B16(a), BitSketch::B16(b)) => assert_eq!(a, b),
         _ => panic!("expected B16 bucket sketch"),
+    }
+    assert_eq!(sketch_a.empty, sketch_b.empty);
+}
+
+#[test]
+fn nthash64_bucket_count_filtering_ignores_coverage() {
+    let seq = PackedSeqVec::from_ascii(b"ACGTTGCATGTCAGTACGATCGTACG");
+    let seqs = [seq.as_slice(), seq.as_slice(), seq.as_slice()];
+    let params = SketchParams {
+        count: 3,
+        coverage: 1,
+        ..params(HashMode::NtHash64, SketchAlg::Bucket, 16)
+    };
+    let sketch_a = params.build().sketch_seqs(&seqs);
+    let sketch_b = SketchParams {
+        coverage: 100,
+        ..params
+    }
+    .build()
+    .sketch_seqs(&seqs);
+
+    let Sketch::BucketSketch(sketch_a) = sketch_a else {
+        panic!("expected bucket sketch")
+    };
+    let Sketch::BucketSketch(sketch_b) = sketch_b else {
+        panic!("expected bucket sketch")
+    };
+    match (&sketch_a.buckets, &sketch_b.buckets) {
+        (BitSketch::B16(a), BitSketch::B16(b)) => {
+            assert_eq!(a, b);
+            assert!(a.iter().any(|x| *x != u16::MAX));
+        }
+        _ => panic!("expected B16 bucket sketch"),
+    }
+    assert_eq!(sketch_a.empty, sketch_b.empty);
+}
+
+#[test]
+fn nthash64_bucket_count_filtering_matches_repeated_records() {
+    let seq = PackedSeqVec::from_ascii(b"ACGTTGCATGTCAGTACGATCGTACG");
+    let repeated = [seq.as_slice(), seq.as_slice(), seq.as_slice()];
+    let counted = SketchParams {
+        count: 3,
+        ..params(HashMode::NtHash64, SketchAlg::Bucket, 16)
+    }
+    .build()
+    .sketch_seqs(&repeated);
+    let uncounted = SketchParams {
+        count: 1,
+        ..params(HashMode::NtHash64, SketchAlg::Bucket, 16)
+    }
+    .build()
+    .sketch(seq.as_slice());
+
+    let Sketch::BucketSketch(counted) = counted else {
+        panic!("expected bucket sketch")
+    };
+    let Sketch::BucketSketch(uncounted) = uncounted else {
+        panic!("expected bucket sketch")
+    };
+    match (&counted.buckets, &uncounted.buckets) {
+        (BitSketch::B16(a), BitSketch::B16(b)) => assert_eq!(a, b),
+        _ => panic!("expected B16 bucket sketch"),
+    }
+    assert_eq!(counted.empty, uncounted.empty);
+}
+
+#[test]
+fn nthash64_bucket_count_filtering_skips_ambiguous_windows() {
+    let bases = PackedSeqVec::from_ascii(b"ACGTTGCA");
+    let clean_flags = BitSeqVec::from_ascii(b"AAAAAAAA");
+    let masked_flags = BitSeqVec::from_ascii(b"NNNNNNNN");
+    let clean = PackedNSeq {
+        seq: bases.as_slice(),
+        ambiguous: clean_flags.as_slice(),
+    };
+    let masked = PackedNSeq {
+        seq: bases.as_slice(),
+        ambiguous: masked_flags.as_slice(),
+    };
+    let sketch = SketchParams {
+        k: 8,
+        s: 16,
+        count: 2,
+        filter_out_n: true,
+        ..params(HashMode::NtHash64, SketchAlg::Bucket, 16)
+    }
+    .build()
+    .sketch_seqs(&[clean, masked]);
+
+    let Sketch::BucketSketch(sketch) = sketch else {
+        panic!("expected bucket sketch")
+    };
+    match &sketch.buckets {
+        BitSketch::B16(buckets) => assert!(buckets.iter().all(|x| *x == u16::MAX)),
+        _ => panic!("expected B16 bucket sketch"),
+    }
+    assert!(sketch.empty.iter().any(|x| *x != 0));
+}
+
+#[test]
+fn legacy32_bucket_count_filtering_is_deterministic() {
+    let seq = PackedSeqVec::from_ascii(b"ACGTTGCATGTCAGTACGATCGTACG");
+    let seqs = [seq.as_slice(), seq.as_slice()];
+    let sketcher = SketchParams {
+        count: 2,
+        ..params(HashMode::Legacy32, SketchAlg::Bucket, 32)
+    }
+    .build();
+
+    let sketch_a = sketcher.sketch_seqs(&seqs);
+    let sketch_b = sketcher.sketch_seqs(&seqs);
+    let Sketch::BucketSketch(sketch_a) = sketch_a else {
+        panic!("expected bucket sketch")
+    };
+    let Sketch::BucketSketch(sketch_b) = sketch_b else {
+        panic!("expected bucket sketch")
+    };
+    match (&sketch_a.buckets, &sketch_b.buckets) {
+        (BitSketch::B32(a), BitSketch::B32(b)) => {
+            assert_eq!(a, b);
+            assert!(a.iter().any(|x| *x != u32::MAX));
+        }
+        _ => panic!("expected B32 bucket sketch"),
     }
     assert_eq!(sketch_a.empty, sketch_b.empty);
 }
