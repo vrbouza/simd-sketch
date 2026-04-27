@@ -30,6 +30,18 @@ fn bucket_sketch_uses_full_width_storage_in_nthash64_mode() {
 }
 
 #[test]
+fn nthash64_bucket_sketch_still_supports_b16_storage() {
+    let seq = PackedSeqVec::from_ascii(b"ACGTACGTACGTACGTACGTACGTACGTACGT");
+    let sketch = params(HashMode::NtHash64, SketchAlg::Bucket, 16)
+        .build()
+        .sketch(seq.as_slice());
+    let Sketch::BucketSketch(sketch) = sketch else {
+        panic!("expected bucket sketch")
+    };
+    assert!(matches!(sketch.buckets, BitSketch::B16(_)));
+}
+
+#[test]
 fn legacy32_bottom_sketch_rounds_to_u64_storage() {
     let seq = PackedSeqVec::from_ascii(b"ACGTACGTACGTACGTACGTACGTACGTACGT");
     let sketch = params(HashMode::Legacy32, SketchAlg::Bottom, 0)
@@ -98,6 +110,33 @@ fn nthash64_bucket_sketch_with_ambiguous_input_is_deterministic() {
     match (&sketch_a.buckets, &sketch_b.buckets) {
         (BitSketch::B64(a), BitSketch::B64(b)) => assert_eq!(a, b),
         _ => panic!("expected B64 bucket sketch"),
+    }
+    assert_eq!(sketch_a.empty, sketch_b.empty);
+}
+
+#[test]
+fn nthash64_multi_record_sketching_is_deterministic() {
+    let seq_a = PackedNSeqVec::from_ascii(b"ACGTNNNNACGTACGTNNNNACGTACGT");
+    let seq_b = PackedNSeqVec::from_ascii(b"NNNNACGTACGTNNNNACGTNACGTACGTNNNN");
+    let seqs = [seq_a.as_slice(), seq_b.as_slice()];
+    let sketcher = SketchParams {
+        filter_out_n: true,
+        ..params(HashMode::NtHash64, SketchAlg::Bucket, 16)
+    }
+    .build();
+
+    let sketch_a = sketcher.sketch_seqs(&seqs);
+    let sketch_b = sketcher.sketch_seqs(&seqs);
+
+    let Sketch::BucketSketch(sketch_a) = sketch_a else {
+        panic!("expected bucket sketch")
+    };
+    let Sketch::BucketSketch(sketch_b) = sketch_b else {
+        panic!("expected bucket sketch")
+    };
+    match (&sketch_a.buckets, &sketch_b.buckets) {
+        (BitSketch::B16(a), BitSketch::B16(b)) => assert_eq!(a, b),
+        _ => panic!("expected B16 bucket sketch"),
     }
     assert_eq!(sketch_a.empty, sketch_b.empty);
 }

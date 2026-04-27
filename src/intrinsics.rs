@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
 use core::mem::transmute;
-use packed_seq::u32x8 as S;
+use packed_seq::Simd as S;
 const L: usize = 8;
 
 /// Append subset of values indicated by `mask` to a vector.
 #[inline(always)]
 #[cfg(not(any(target_feature = "avx2", target_feature = "neon")))]
-pub unsafe fn append_from_mask<T>(vals: S, mask: S, v: &mut [T], write_idx: &mut usize) {
+pub unsafe fn append_from_mask(vals: S, mask: S, v: &mut [u32], write_idx: &mut usize) {
     unsafe {
         let vals = vals.to_array();
         for (val, m) in vals.iter().zip(mask.to_array().iter()) {
@@ -22,7 +22,7 @@ pub unsafe fn append_from_mask<T>(vals: S, mask: S, v: &mut [T], write_idx: &mut
 /// Append subset of values indicated by `mask` to a vector.
 #[inline(always)]
 #[cfg(target_feature = "avx2")]
-pub unsafe fn append_from_mask<T>(vals: S, mask: S, v: &mut [T], write_idx: &mut usize) {
+pub unsafe fn append_from_mask(vals: S, mask: S, v: &mut [u32], write_idx: &mut usize) {
     if mask == S::ZERO {
         return;
     }
