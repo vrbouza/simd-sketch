@@ -444,8 +444,8 @@ impl Sketcher {
             let mut filter = KmerFilter::new(self.params.count);
             filter.init();
             self.for_each_hash(seqs, |hash| {
-                if filter.filter(hash) == Ordering::Equal {
-                    let bucket = (hash % self.params.s as u64) as usize;
+                let bucket = (hash % self.params.s as u64) as usize;
+                if hash < buckets[bucket] && filter.filter(hash) == Ordering::Equal {
                     buckets[bucket] = buckets[bucket].min(hash);
                 }
             });
@@ -623,6 +623,27 @@ mod test {
     use super::*;
     use packed_seq::{PackedNSeqVec, PackedSeqVec, SeqVec};
 
+    #[derive(Clone, Copy)]
+    struct FixedHashes {
+        hashes: &'static [u64],
+    }
+
+    impl Sketchable for FixedHashes {
+        fn len(self) -> usize {
+            self.hashes.len()
+        }
+
+        fn legacy_hashes<H: KmerHasher>(self, _hasher: &H) -> Vec<u32> {
+            self.hashes.iter().map(|hash| *hash as u32).collect()
+        }
+
+        fn nthash64_hashes(self, _k: usize, _rc: bool, callback: &mut dyn FnMut(u64)) {
+            for hash in self.hashes {
+                callback(*hash);
+            }
+        }
+    }
+
     #[test]
     fn legacy_and_nt64_self_distance_zero() {
         let seq = PackedSeqVec::from_ascii(b"ACGTACGTACGTACGTACGTACGTACGTACGT");
@@ -668,5 +689,36 @@ mod test {
             _ => unreachable!(),
         };
         assert!(sketch.bottom.iter().any(|x| *x != u64::MAX));
+    }
+
+    #[test]
+    fn bucket_count_filter_only_sees_candidate_minima() {
+        crate::bloom_filter::reset_filter_call_count();
+        let sketch = SketchParams {
+            alg: SketchAlg::Bucket,
+            hash_mode: HashMode::NtHash64,
+            rc: true,
+            k: 1,
+            s: 1,
+            b: 64,
+            seed: 0,
+            count: 2,
+            coverage: 1,
+            filter_empty: true,
+            filter_out_n: false,
+        }
+        .build()
+        .sketch(FixedHashes {
+            hashes: &[10, 10, 20, 20, 20],
+        });
+
+        let Sketch::BucketSketch(sketch) = sketch else {
+            panic!("expected bucket sketch")
+        };
+        match sketch.buckets {
+            BitSketch::B64(buckets) => assert_eq!(buckets, vec![10]),
+            _ => panic!("expected B64 bucket sketch"),
+        }
+        assert_eq!(crate::bloom_filter::filter_call_count(), 2);
     }
 }

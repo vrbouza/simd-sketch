@@ -3,6 +3,11 @@ use std::{cmp::Ordering, collections::HashMap};
 const BLOOM_WIDTH: usize = 1 << 27;
 const BITS_PER_ENTRY: usize = 12;
 
+#[cfg(test)]
+thread_local! {
+    static FILTER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct KmerFilter {
     buf_size: u64,
@@ -74,6 +79,9 @@ impl KmerFilter {
     }
 
     pub(crate) fn filter(&mut self, hash: u64) -> Ordering {
+        #[cfg(test)]
+        FILTER_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         match self.min_count {
             0 | 1 => Ordering::Equal,
             2 => {
@@ -100,6 +108,16 @@ impl KmerFilter {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_filter_call_count() {
+    FILTER_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn filter_call_count() -> usize {
+    FILTER_CALLS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
