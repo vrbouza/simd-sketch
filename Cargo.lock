@@ -508,6 +508,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "packed-seq"
 version = "4.4.2"
+source = "git+https://github.com/vrbouza/packed-seq.git?branch=wasmsimd#06cfa30d1ca7b810d9bee1b9d8c281d278544544"
 dependencies = [
  "cfg-if",
  "ensure_simd",
